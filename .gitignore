@@ -22,7 +22,7 @@
 .DS_store
 
 # Nested build directory
-/build
+/build*
 
 #==============================================================================#
 # Explicit files to ignore (only matches one).
@@ -41,6 +41,7 @@ cscope.out
 autoconf/aclocal.m4
 autoconf/autom4te.cache
 /compile_commands.json
+*.srctrl*
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
