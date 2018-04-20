@@ -405,28 +405,23 @@ bool InstCombiner::SimplifyAssociativeOrCommutative(BinaryOperator &I) {
 
       // Transform: "(A op C1) op (B op C2)" ==> "(A op B) op (C1 op C2)"
       // if C1 and C2 are constants.
+      Value *A, *B;
+      Constant *C1, *C2;
       if (Op0 && Op1 &&
           Op0->getOpcode() == Opcode && Op1->getOpcode() == Opcode &&
-          isa<Constant>(Op0->getOperand(1)) &&
-          isa<Constant>(Op1->getOperand(1)) &&
-          Op0->hasOneUse() && Op1->hasOneUse()) {
-        Value *A = Op0->getOperand(0);
-        Constant *C1 = cast<Constant>(Op0->getOperand(1));
-        Value *B = Op1->getOperand(0);
-        Constant *C2 = cast<Constant>(Op1->getOperand(1));
-
-        Constant *Folded = ConstantExpr::get(Opcode, C1, C2);
-        BinaryOperator *New = BinaryOperator::Create(Opcode, A, B);
-        if (isa<FPMathOperator>(New)) {
+          match(Op0, m_OneUse(m_BinOp(m_Value(A), m_Constant(C1)))) &&
+          match(Op1, m_OneUse(m_BinOp(m_Value(B), m_Constant(C2))))) {
+        BinaryOperator *NewBO = BinaryOperator::Create(Opcode, A, B);
+        if (isa<FPMathOperator>(NewBO)) {
           FastMathFlags Flags = I.getFastMathFlags();
           Flags &= Op0->getFastMathFlags();
           Flags &= Op1->getFastMathFlags();
-          New->setFastMathFlags(Flags);
+          NewBO->setFastMathFlags(Flags);
         }
-        InsertNewInstWith(New, I);
-        New->takeName(Op1);
-        I.setOperand(0, New);
-        I.setOperand(1, Folded);
+        InsertNewInstWith(NewBO, I);
+        NewBO->takeName(Op1);
+        I.setOperand(0, NewBO);
+        I.setOperand(1, ConstantExpr::get(Opcode, C1, C2));
         // Conservatively clear the optional flags, since they may not be
         // preserved by the reassociation.
         ClearSubclassDataAfterReassociation(I);
@@ -486,37 +481,27 @@ static Value *getIdentityValue(Instruction::BinaryOps Opcode, Value *V) {
   return ConstantExpr::getBinOpIdentity(Opcode, V->getType());
 }
 
-/// This function factors binary ops which can be combined using distributive
-/// laws. This function tries to transform 'Op' based TopLevelOpcode to enable
-/// factorization e.g for ADD(SHL(X , 2), MUL(X, 5)), When this function called
-/// with TopLevelOpcode == Instruction::Add and Op = SHL(X, 2), transforms
-/// SHL(X, 2) to MUL(X, 4) i.e. returns Instruction::Mul with LHS set to 'X' and
-/// RHS to 4.
+/// This function predicates factorization using distributive laws. By default,
+/// it just returns the 'Op' inputs. But for special-cases like
+/// 'add(shl(X, 5), ...)', this function will have TopOpcode == Instruction::Add
+/// and Op = shl(X, 5). The 'shl' is treated as the more general 'mul X, 32' to
+/// allow more factorization opportunities.
 static Instruction::BinaryOps
-getBinOpsForFactorization(Instruction::BinaryOps TopLevelOpcode,
-                          BinaryOperator *Op, Value *&LHS, Value *&RHS) {
+getBinOpsForFactorization(Instruction::BinaryOps TopOpcode, BinaryOperator *Op,
+                          Value *&LHS, Value *&RHS) {
   assert(Op && "Expected a binary operator");
-
   LHS = Op->getOperand(0);
   RHS = Op->getOperand(1);
-
-  switch (TopLevelOpcode) {
-  default:
-    return Op->getOpcode();
-
-  case Instruction::Add:
-  case Instruction::Sub:
-    if (Op->getOpcode() == Instruction::Shl) {
-      if (Constant *CST = dyn_cast<Constant>(Op->getOperand(1))) {
-        // The multiplier is really 1 << CST.
-        RHS = ConstantExpr::getShl(ConstantInt::get(Op->getType(), 1), CST);
-        return Instruction::Mul;
-      }
+  if (TopOpcode == Instruction::Add || TopOpcode == Instruction::Sub) {
+    Constant *C;
+    if (match(Op, m_Shl(m_Value(), m_Constant(C)))) {
+      // X << C --> X * (1 << C)
+      RHS = ConstantExpr::getShl(ConstantInt::get(Op->getType(), 1), C);
+      return Instruction::Mul;
     }
-    return Op->getOpcode();
+    // TODO: We can add other conversions e.g. shr => div etc.
   }
-
-  // TODO: We can add other conversions e.g. shr => div etc.
+  return Op->getOpcode();
 }
 
 /// This tries to simplify binary operations by factorizing out common terms
@@ -1960,14 +1945,34 @@ Instruction *InstCombiner::visitGetElementPtrInst(GetElementPtrInst &GEP) {
       PtrOp = BC;
   }
 
-  /// See if we can simplify:
-  ///   X = bitcast A* to B*
-  ///   Y = gep X, <...constant indices...>
-  /// into a gep of the original struct.  This is important for SROA and alias
-  /// analysis of unions.  If "A" is also a bitcast, wait for A/X to be merged.
   if (auto *BCI = dyn_cast<BitCastInst>(PtrOp)) {
     Value *SrcOp = BCI->getOperand(0);
     PointerType *SrcType = cast<PointerType>(BCI->getSrcTy());
+    Type *SrcEltType = SrcType->getElementType();
+
+    // GEP directly using the source operand if this GEP is accessing an element
+    // of a bitcasted pointer to vector or array of the same dimensions:
+    // gep (bitcast <c x ty>* X to [c x ty]*), Y, Z --> gep X, Y, Z
+    // gep (bitcast [c x ty]* X to <c x ty>*), Y, Z --> gep X, Y, Z
+    auto areMatchingArrayAndVecTypes = [](Type *ArrTy, Type *VecTy) {
+      return ArrTy->getArrayElementType() == VecTy->getVectorElementType() &&
+             ArrTy->getArrayNumElements() == VecTy->getVectorNumElements();
+    };
+    if (GEP.getNumOperands() == 3 &&
+        ((GEPEltType->isArrayTy() && SrcEltType->isVectorTy() &&
+          areMatchingArrayAndVecTypes(GEPEltType, SrcEltType)) ||
+         (GEPEltType->isVectorTy() && SrcEltType->isArrayTy() &&
+          areMatchingArrayAndVecTypes(SrcEltType, GEPEltType)))) {
+      GEP.setOperand(0, SrcOp);
+      GEP.setSourceElementType(SrcEltType);
+      return &GEP;
+    }
+
+    // See if we can simplify:
+    //   X = bitcast A* to B*
+    //   Y = gep X, <...constant indices...>
+    // into a gep of the original struct. This is important for SROA and alias
+    // analysis of unions. If "A" is also a bitcast, wait for A/X to be merged.
     unsigned OffsetBits = DL.getIndexTypeSizeInBits(GEPType);
     APInt Offset(OffsetBits, 0);
     if (!isa<BitCastInst>(SrcOp) && GEP.accumulateConstantOffset(DL, Offset)) {
@@ -2892,6 +2897,7 @@ Instruction *InstCombiner::visitLandingPadInst(LandingPadInst &LI) {
 /// block.
 static bool TryToSinkInstruction(Instruction *I, BasicBlock *DestBlock) {
   assert(I->hasOneUse() && "Invariants didn't hold!");
+  BasicBlock *SrcBlock = I->getParent();
 
   // Cannot move control-flow-involving, volatile loads, vaarg, etc.
   if (isa<PHINode>(I) || I->isEHPad() || I->mayHaveSideEffects() ||
@@ -2921,10 +2927,20 @@ static bool TryToSinkInstruction(Instruction *I, BasicBlock *DestBlock) {
       if (Scan->mayWriteToMemory())
         return false;
   }
-
   BasicBlock::iterator InsertPos = DestBlock->getFirstInsertionPt();
   I->moveBefore(&*InsertPos);
   ++NumSunkInst;
+
+  // Also sink all related debug uses from the source basic block. Otherwise we
+  // get debug use before the def.
+  SmallVector<DbgInfoIntrinsic *, 1> DbgUsers;
+  findDbgUsers(DbgUsers, I);
+  for (auto *DII : DbgUsers) {
+    if (DII->getParent() == SrcBlock) {
+      DII->moveBefore(&*InsertPos);
+      DEBUG(dbgs() << "SINK: " << *DII << '\n');
+    }
+  }
   return true;
 }
 
