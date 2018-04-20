@@ -1,3 +1,6 @@
 [submodule "tools/clang"]
 	path = tools/clang
 	url = git@github.com:rcoscali/clang.git
+[submodule "projects/compiler-rt"]
+	path = projects/compiler-rt
+	url = git@github.com:rcoscali/compiler-rt.git
